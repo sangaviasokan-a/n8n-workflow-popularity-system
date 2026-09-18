@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -27,9 +28,11 @@ class ForumCollector(BaseCollector):
         self,
         base_url: str = FORUM_API_BASE,
         timeout: float = 30.0,
+        max_concurrency: int = 5,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.max_concurrency = max_concurrency
 
     @retry(
         retry=retry_if_exception_type(
@@ -196,15 +199,18 @@ class ForumCollector(BaseCollector):
     @staticmethod
     def _safe_int(
         value: Any,
-    ) -> int:
+    ) -> int | None:
         """
         Convert a value to a non-negative integer.
+
+        None remains None so that an unavailable metric
+        is not confused with a true zero.
         """
 
-        try:
-            if value is None:
-                return 0
+        if value is None:
+            return None
 
+        try:
             number = int(value)
 
             return max(
@@ -216,38 +222,52 @@ class ForumCollector(BaseCollector):
             TypeError,
             ValueError,
         ):
-            return 0
+            return None
 
     def _normalize_topic(
         self,
         item: dict[str, Any],
+        detailed: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """
         Convert a Discourse topic/search response into
         the repository's normalized forum record format.
+
+        Detailed topic-level metrics are preferred because
+        Discourse search results do not reliably contain
+        views, likes, or participant counts.
         """
 
         if not isinstance(item, dict):
             return None
 
+        if not isinstance(detailed, dict):
+            detailed = {}
+
         topic_id = (
-            item.get("id")
+            detailed.get("id")
+            or item.get("id")
             or item.get("topic_id")
         )
 
-        title = item.get("title")
+        title = (
+            detailed.get("title")
+            or item.get("title")
+        )
 
         if not topic_id or not title:
             return None
 
         topic_id = str(topic_id).strip()
-
         title = str(title).strip()
 
         if not topic_id or not title:
             return None
 
-        slug = item.get("slug")
+        slug = (
+            detailed.get("slug")
+            or item.get("slug")
+        )
 
         if slug:
             url = (
@@ -261,30 +281,50 @@ class ForumCollector(BaseCollector):
             )
 
         created_at = (
-            item.get("created_at")
+            detailed.get("created_at")
+            or item.get("created_at")
             or item.get("created")
         )
 
+        # Discourse topic-level fields.
+        #
+        # Important:
+        # "views" is the topic's actual view count.
+        # "reads" belongs to an individual post and is
+        # not used as the topic view metric.
         views = self._safe_int(
-            item.get("views")
+            detailed.get("views")
+            if "views" in detailed
+            else item.get("views")
         )
 
         replies = self._safe_int(
-            item.get("reply_count")
-            or item.get("replies")
+            detailed.get("reply_count")
+            if "reply_count" in detailed
+            else (
+                item.get("reply_count")
+                or item.get("replies")
+            )
         )
 
         likes = self._safe_int(
-            item.get("like_count")
-            or item.get("likes")
+            detailed.get("like_count")
+            if "like_count" in detailed
+            else (
+                item.get("like_count")
+                or item.get("likes")
+            )
         )
 
         contributors = self._safe_int(
-            item.get("participant_count")
-            or item.get("contributors")
+            detailed.get("participant_count")
+            if "participant_count" in detailed
+            else (
+                item.get("participant_count")
+                or item.get("contributors")
+            )
         )
 
-        # Validate before returning the record.
         if not self.validate_metrics(
             views,
             replies,
@@ -299,7 +339,9 @@ class ForumCollector(BaseCollector):
             "topic_id": topic_id,
             "title": title,
             "description": (
-                item.get("blurb")
+                detailed.get("blurb")
+                or detailed.get("excerpt")
+                or item.get("blurb")
                 or item.get("excerpt")
                 or ""
             ),
@@ -316,6 +358,52 @@ class ForumCollector(BaseCollector):
             "country": None,
         }
 
+    async def _fetch_detailed_topic(
+        self,
+        item: dict[str, Any],
+        semaphore: asyncio.Semaphore,
+    ) -> dict[str, Any] | None:
+        """
+        Fetch detailed topic information with bounded
+        concurrency.
+        """
+
+        topic_id = (
+            item.get("id")
+            or item.get("topic_id")
+        )
+
+        if not topic_id:
+            return None
+
+        async with semaphore:
+
+            try:
+                detailed = await self.get_topic(
+                    topic_id
+                )
+
+                return self._normalize_topic(
+                    item,
+                    detailed,
+                )
+
+            except Exception:
+                logger.exception(
+                    "n8n Community topic fetch failed",
+                    extra={
+                        "topic_id": topic_id,
+                    },
+                )
+
+                # Preserve the topic if detailed metrics
+                # cannot be fetched. Search data may still
+                # contain useful fields.
+                return self._normalize_topic(
+                    item,
+                    None,
+                )
+
     async def collect(
         self,
         queries: list[str] | None = None,
@@ -326,6 +414,9 @@ class ForumCollector(BaseCollector):
         Collect n8n Community topics for multiple queries.
 
         Topics are deduplicated by topic ID.
+
+        Detailed topic metrics are fetched concurrently
+        with a bounded concurrency limit.
 
         If one query fails, collection continues with
         the remaining queries.
@@ -341,6 +432,9 @@ class ForumCollector(BaseCollector):
         records: list[dict[str, Any]] = []
 
         seen_topic_ids: set[str] = set()
+
+        # First collect unique search-result topics.
+        search_items: list[dict[str, Any]] = []
 
         for raw_query in queries:
 
@@ -368,23 +462,31 @@ class ForumCollector(BaseCollector):
                         [],
                     )
 
-                    # Stop pagination when no results
-                    # are returned.
                     if not topics:
                         break
 
                     for topic in topics:
 
-                        record = self._normalize_topic(
-                            topic
+                        if not isinstance(
+                            topic,
+                            dict,
+                        ):
+                            continue
+
+                        topic_id = (
+                            topic.get("id")
+                            or topic.get("topic_id")
                         )
 
-                        if record is None:
+                        if not topic_id:
                             continue
 
                         topic_id = str(
-                            record["source_id"]
-                        )
+                            topic_id
+                        ).strip()
+
+                        if not topic_id:
+                            continue
 
                         if topic_id in seen_topic_ids:
                             continue
@@ -393,8 +495,8 @@ class ForumCollector(BaseCollector):
                             topic_id
                         )
 
-                        records.append(
-                            record
+                        search_items.append(
+                            topic
                         )
 
                 except Exception:
@@ -406,13 +508,41 @@ class ForumCollector(BaseCollector):
                         },
                     )
 
-                    # Continue with the next query.
                     break
+
+        # Fetch detailed topic data with bounded
+        # concurrency instead of making hundreds of
+        # sequential requests.
+        semaphore = asyncio.Semaphore(
+            max(
+                1,
+                self.max_concurrency,
+            )
+        )
+
+        detailed_records = await asyncio.gather(
+            *[
+                self._fetch_detailed_topic(
+                    item,
+                    semaphore,
+                )
+                for item in search_items
+            ],
+            return_exceptions=False,
+        )
+
+        for record in detailed_records:
+
+            if record is None:
+                continue
+
+            records.append(record)
 
         logger.info(
             "Forum collection completed",
             extra={
                 "queries": len(queries),
+                "search_topics": len(search_items),
                 "records": len(records),
             },
         )
